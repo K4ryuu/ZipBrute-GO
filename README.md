@@ -108,4 +108,4 @@ Again: **Educational purposes only.** I'm not responsible for what you do with t
 
 ## License
 
-MIT or whatever, just don't be a dick.
+MIT or whatever, just don't be a d!ck.
