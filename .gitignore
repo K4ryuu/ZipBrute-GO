@@ -1,0 +1,32 @@
+# Binaries
+zipcracker
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+test.txt
+test_*.zip
+*_benchmark.zip
+benchmark_*.txt
+
+# Go
+*.test
+*.out
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.log
