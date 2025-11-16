@@ -41,7 +41,6 @@ Actual performance depends on CPU, charset size, and password complexity.
 ## Install
 
 ```bash
-go get github.com/yeka/zip
 ./zipcracker.sh build
 ```
 
