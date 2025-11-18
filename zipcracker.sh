@@ -24,7 +24,7 @@ case "$1" in
     MIN="${4:-1}"
     MAX="${5:-8}"
 
-    ./zipcracker -f "$ZIP" -c "$CHARSET" -min "$MIN" -max "$MAX"
+    ./zipcracker -f "$ZIP" -c "$CHARSET" -min "$MIN" -max "$MAX" --auto
     ;;
 
   *)

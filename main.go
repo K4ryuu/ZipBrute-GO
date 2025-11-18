@@ -46,53 +46,48 @@ func (z *ZipCryptoChecker) checkPassword(password []byte) bool {
 		key2 = table[byte(key2)^byte(key1>>24)] ^ (key2 >> 8)
 	}
 
-	// byte 11 check
 	temp := key2 | 2
 	c := byte((temp*(temp^1))>>8) ^ encHeader[11]
 	return c == expectedByte
 }
 
 type Cracker struct {
-	zipPath         string
-	zipData         []byte
-	charset         []byte
-	minLen          int
-	maxLen          int
-	workers         int
-	attempts        uint64
-	checked         uint64
-	startTime       time.Time
-	found           atomic.Bool
-	result          string
-	resultMux       sync.Mutex
-	cryptoCheck     *ZipCryptoChecker
-	useHashCheck    bool
-	globalZipReader *zip.Reader
-	readerMux       sync.Mutex
+	zipPath      string
+	zipData      []byte
+	charset      []byte
+	minLen       int
+	maxLen       int
+	workers      int
+	startTime    time.Time
+	cryptoCheck  *ZipCryptoChecker
+	useHashCheck bool
+
+	attempts  uint64
+	checked   uint64
+	found     atomic.Bool
+	result    string
+	resultMux sync.Mutex
 }
 
 type workerContext struct {
-	file *zip.File
+	zipReader *zip.Reader
+	file      *zip.File
 }
 
 func (c *Cracker) newWorkerContext() (*workerContext, error) {
-	c.readerMux.Lock()
-	defer c.readerMux.Unlock()
-
-	if c.globalZipReader == nil {
-		r, err := zip.NewReader(bytes.NewReader(c.zipData), int64(len(c.zipData)))
-		if err != nil {
-			return nil, err
-		}
-		c.globalZipReader = r
+	// Each worker needs its own zip.Reader instance for thread safety
+	r, err := zip.NewReader(bytes.NewReader(c.zipData), int64(len(c.zipData)))
+	if err != nil {
+		return nil, err
 	}
 
-	if len(c.globalZipReader.File) == 0 {
+	if len(r.File) == 0 {
 		return nil, fmt.Errorf("empty zip")
 	}
 
 	return &workerContext{
-		file: c.globalZipReader.File[0],
+		zipReader: r,
+		file:      r.File[0],
 	}, nil
 }
 
@@ -277,13 +272,80 @@ func extractVerificationBytes(zipData []byte) (*ZipCryptoChecker, bool) {
 	return checker, true
 }
 
-func (c *Cracker) crack() (string, bool) {
-	c.startTime = time.Now()
+func (c *Cracker) autoTuneWorkers(testDuration time.Duration) int {
+	candidates := []int{300, 500, 800, 1000, 1200}
+	bestWorkers := 1000
+	bestSpeed := 0.0
 
+	fmt.Printf("[*] Auto-tuning worker count (testing %d candidates)...\n", len(candidates))
+
+	for _, workerCount := range candidates {
+		c.workers = workerCount
+		c.attempts = 0
+		c.checked = 0
+		c.found.Store(false)
+		c.startTime = time.Now()
+
+		// Quick benchmark test
+		var wg sync.WaitGroup
+		done := make(chan bool)
+
+		// Use a reasonable test length (at least 8) to ensure enough work
+		testLen := c.minLen
+		if testLen < 8 {
+			testLen = 8
+		}
+
+		// Start a limited number of test workers
+		testTotal := c.calculateTotal(testLen)
+		testChunk := testTotal / uint64(workerCount)
+		if testChunk == 0 {
+			testChunk = 1
+		}
+
+		for i := 0; i < workerCount; i++ {
+			start := uint64(i) * testChunk
+			end := min(start+testChunk, testTotal)
+			wg.Add(1)
+			go c.rangeWorker(start, end, testLen, &wg)
+		}
+
+		// Wait for test duration
+		go func() {
+			time.Sleep(testDuration)
+			c.found.Store(true)
+			done <- true
+		}()
+
+		<-done
+		wg.Wait()
+
+		elapsed := time.Since(c.startTime).Seconds()
+		checked := atomic.LoadUint64(&c.checked)
+		speed := float64(checked) / elapsed
+
+		fmt.Printf("  [%4d workers] %.1f M/s\n", workerCount, speed/1000000)
+
+		if speed > bestSpeed {
+			bestSpeed = speed
+			bestWorkers = workerCount
+		}
+	}
+
+	fmt.Printf("[+] Optimal worker count: %d (%.1f M/s)\n\n", bestWorkers, bestSpeed/1000000)
+
+	// Reset found flag before returning
+	c.found.Store(false)
+	c.attempts = 0
+	c.checked = 0
+
+	return bestWorkers
+}
+
+func (c *Cracker) loadZip() error {
 	data, err := os.ReadFile(c.zipPath)
 	if err != nil {
-		fmt.Printf("error: %v\n", err)
-		return "", false
+		return err
 	}
 	c.zipData = data
 
@@ -296,13 +358,18 @@ func (c *Cracker) crack() (string, bool) {
 		c.useHashCheck = false
 		fmt.Printf("[+] AES encryption detected\n")
 	}
+	return nil
+}
+
+func (c *Cracker) crack() (string, bool) {
+	c.startTime = time.Now()
 
 	stopMonitor := make(chan bool)
 	go c.monitor(stopMonitor)
 	defer close(stopMonitor)
 
 	fmt.Printf("\n[*] file: %d KB | charset: %d | length: %d-%d | workers: %d\n",
-		len(data)/1024, len(c.charset), c.minLen, c.maxLen, c.workers)
+		len(c.zipData)/1024, len(c.charset), c.minLen, c.maxLen, c.workers)
 
 	for length := c.minLen; length <= c.maxLen; length++ {
 		if c.found.Load() {
@@ -371,6 +438,7 @@ func main() {
 	minLen := flag.Int("min", 1, "min password length")
 	maxLen := flag.Int("max", 32, "max password length")
 	workers := flag.Int("w", 0, "number of workers (0 = auto)")
+	autoTune := flag.Bool("auto", false, "auto-tune optimal worker count at startup")
 
 	flag.Parse()
 
@@ -387,7 +455,7 @@ func main() {
 	}
 
 	if *workers == 0 {
-		*workers = min(runtime.NumCPU()*10, 200)
+		*workers = runtime.NumCPU() * 10
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -405,6 +473,18 @@ func main() {
 		minLen:  *minLen,
 		maxLen:  *maxLen,
 		workers: *workers,
+	}
+
+	// Load ZIP file data
+	if err := cracker.loadZip(); err != nil {
+		fmt.Printf("[-] error loading zip: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Auto-tune worker count if requested
+	if *autoTune {
+		optimalWorkers := cracker.autoTuneWorkers(2 * time.Second)
+		cracker.workers = optimalWorkers
 	}
 
 	cracker.crack()
